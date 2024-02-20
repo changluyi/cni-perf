@@ -1,0 +1,534 @@
+#!/bin/bash
+set -euo pipefail
+
+PERF_TEST_NS=perf-test
+PERF_TIMES=5
+PERF_LABEL="PerfTest"
+PERF_GC_COMMAND=()
+LAST_PERF_FAILED_LOG=""
+NODE1=
+NODE2=
+IMAGE_ID="docker.io/kubeovn/test:v1.13.0"
+CNI=
+OVN_NB_POD=
+WRK_TIME=30s
+
+cases=("Pod to Pod in the same Nodes"
+        "Pod to Pod in the different Nodes"
+        "Node to Node"
+        "Pod to the Node where the Pod is located"
+        "Pod to the Node where the Pod is not located"
+        "Pod to the cluster ip service"
+        "Host to the Node port service where the Pod is not located on the target Node"
+        "Host to the Node port service where the Pod is located on the target Node"
+        "Host to the lb service"
+        )
+
+applyTestServer() {
+  podName=$1
+  nodeID=$2
+  cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $podName
+  namespace: $PERF_TEST_NS
+  labels:
+    app: $PERF_LABEL
+    env: $podName
+spec:
+  containers:
+    - name: $podName
+      image: $IMAGE_ID
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c"]
+      args:
+        - |
+          qperf &
+          ./test-server.sh
+  nodeSelector:
+    kubernetes.io/hostname: $nodeID
+EOF
+}
+
+applyTestHostServer() {
+  podName=$1
+  nodeID=$2
+  cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $podName
+  namespace: $PERF_TEST_NS
+  labels:
+    app: $PERF_LABEL
+spec:
+  hostNetwork: true
+  containers:
+    - name: $podName
+      image: $IMAGE_ID
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c"]
+      args:
+        - |
+          qperf &
+          ./test-server.sh
+  nodeSelector:
+    kubernetes.io/hostname: $nodeID
+EOF
+}
+
+applyTestClient() {
+  local podName=$1
+  local nodeID=$2
+  cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $podName
+  namespace: $PERF_TEST_NS
+  labels:
+    app: $PERF_LABEL
+spec:
+  containers:
+    - name: $podName
+      image: $IMAGE_ID
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "sleep infinity"]
+  nodeSelector:
+    kubernetes.io/hostname: $nodeID
+EOF
+}
+
+applyTestHostClient() {
+  podName=$1
+  nodeID=$2
+  cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $podName
+  namespace: $PERF_TEST_NS
+  labels:
+    app: $PERF_LABEL
+spec:
+  hostNetwork: true
+  containers:
+    - name: $podName
+      image: $IMAGE_ID
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "sleep infinity"]
+  nodeSelector:
+    kubernetes.io/hostname: $nodeID
+EOF
+}
+
+applyTestServerClusterService() {
+  svcName=$1
+  tagName=$2
+  cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: $PERF_LABEL
+  name: $svcName
+  namespace: $PERF_TEST_NS
+spec:
+  ports:
+    - port: 19765
+      protocol: UDP
+      targetPort: 19765
+      name: qperf-udp
+    - port: 5201
+      protocol: UDP
+      targetPort: 5201
+      name: iperf3-udp
+    - port: 19765
+      protocol: TCP
+      targetPort: 19765
+      name: qperf-tcp
+    - port: 5201
+      protocol: TCP
+      targetPort: 5201
+      name: iperf3-tcp
+    - port: 80
+      protocol: TCP
+      targetPort: 80
+      name: nginx
+  selector:
+    env: $tagName
+EOF
+}
+
+applyTestServerNodePortService() {
+  svcName=$1
+  tagName=$2
+  cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: $PERF_LABEL
+  name: $svcName
+  namespace: $PERF_TEST_NS
+spec:
+  ports:
+    - port: 80
+      protocol: TCP
+      targetPort: 80
+      name: nginx
+  type: NodePort
+  selector:
+    env: $tagName
+EOF
+}
+
+applyTestServerLBService() {
+  svcName=$1
+  tagName=$2
+  cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: $PERF_LABEL
+  name: $svcName
+  namespace: $PERF_TEST_NS
+spec:
+  ports:
+    - port: 80
+      protocol: TCP
+      targetPort: 80
+      name: nginx
+  type: LoadBalancer
+  selector:
+    env: $tagName
+EOF
+}
+
+addHeaderDecoration() {
+  local header="$1"
+  local decorator="="
+
+  local totalLength=100
+  local headerLength=${#header}
+  local decoratorLength=$(( (totalLength - headerLength - 2) / 2 ))
+
+  local leftDecorators=$(printf "%0.s${decorator}" $(seq 1 $decoratorLength))
+  local rightDecorators=$(printf "%0.s${decorator}" $(seq 1 $((totalLength - headerLength - decoratorLength - 2))))
+
+  printf "%s %s %s\n" "${leftDecorators}" "${header}" "${rightDecorators}"
+}
+
+addEndDecoration() {
+  echo "===================================================================================================="
+}
+
+quitPerfTest() {
+  if [ ! $? -eq 0 ]; then
+    addHeaderDecoration "Performance Test Failed with below: "
+    cat ./$LAST_PERF_FAILED_LOG
+    addEndDecoration
+  fi
+
+  addHeaderDecoration "Remove Performance Test Resource"
+  if [ ! ${#PERF_GC_COMMAND[@]} -eq 0 ]; then
+    for item in "${PERF_GC_COMMAND[@]}"
+    do
+        echo $item
+        eval "$item"
+    done
+  fi
+  kubectl delete pods -l app=$PERF_LABEL -n $PERF_TEST_NS
+  kubectl delete svc -l app=$PERF_LABEL -n $PERF_TEST_NS
+  kubectl delete ns $PERF_TEST_NS
+
+  addEndDecoration
+  exit 0
+}
+
+prepareCaseResource(){
+  caseNum=$1
+  addHeaderDecoration "Prepareing Performance Test Resources"
+
+  case $caseNum in
+  1)
+    applyTestClient $caseNum-"client" $NODE1
+    applyTestServer $caseNum-"server" $NODE1
+    ;;
+  2)
+    applyTestClient $caseNum-"client" $NODE1
+    applyTestServer $caseNum-"server" $NODE2
+    ;;
+  3)
+    applyTestHostClient $caseNum-"client" $NODE1
+    applyTestHostServer $caseNum-"server" $NODE2
+    ;;
+  4)
+    applyTestClient $caseNum-"client" $NODE1
+    applyTestHostServer $caseNum-"server" $NODE1
+    ;;
+  5)
+    applyTestClient $caseNum-"client" $NODE1
+    applyTestHostServer $caseNum-"server" $NODE2
+    ;;
+  6)
+    applyTestClient $caseNum-"client" $NODE1
+    applyTestServer $caseNum-"server" $NODE2
+    applyTestServerClusterService "service"-$caseNum $caseNum-"server"
+    ;;
+  7)
+    applyTestHostClient $caseNum-"client" $NODE1
+    applyTestServer $caseNum-"server" $NODE2
+    applyTestServerNodePortService "service"-$caseNum $caseNum-"server"
+    ;;
+  8)
+    applyTestHostClient $caseNum-"client" $NODE1
+    applyTestServer $caseNum-"server" $NODE2
+    applyTestServerNodePortService "service"-$caseNum $caseNum-"server"
+    ;;
+  9)
+    applyTestHostClient $caseNum-"client" $NODE1
+    applyTestServer $caseNum-"server" $NODE2
+    applyTestServerLBService "service"-$caseNum $caseNum-"server"
+    ;;
+  *)
+    echo "unknown case"
+    ;;
+  esac
+
+  isfailed=true
+  for i in {0..300}
+  do
+    if kubectl wait pod --for=condition=Ready -l app=$PERF_LABEL -n perf-test 2>/dev/null ; then
+      isfailed=false
+      break
+    fi
+		sleep 1; \
+	done
+
+  if $isfailed; then
+    echo "Error test pod not ready"
+    return
+  fi
+  addEndDecoration
+}
+
+cleanCaseResource() {
+  kubectl delete pods -l app=$PERF_LABEL -n $PERF_TEST_NS
+  kubectl delete svc -l app=$PERF_LABEL -n $PERF_TEST_NS
+}
+
+
+perfTest(){
+  CNI=$1
+  NODE1=$2
+  NODE2=$3
+  caseList=${4:-"1,2,3"}
+
+  if [ "$CNI" != "CALICO" ] && [ "$CNI" != "KUBE-OVN" ] && [ "$CNI" != "OTHER" ]; then
+    echo "not support cni type $CNI"
+    return
+  fi
+
+  if ! kubectl get node $NODE1 --no-headers -o custom-columns=NAME:.metadata.name > /dev/null; then
+    echo "can't find node $NODE1"
+    return
+  fi
+
+  if ! kubectl get node $NODE2 --no-headers -o custom-columns=NAME:.metadata.name > /dev/null; then
+    echo "can't find node $NODE2"
+    return
+  fi
+
+  if ! kubectl get ns $PERF_TEST_NS > /dev/null 2>&1 ; then
+    kubectl create ns $PERF_TEST_NS
+  fi
+
+#  trap quitPerfTest EXIT
+
+  array=($(echo "$caseList" | tr ',' ' '))
+
+  for caseNum in "${array[@]}"; do
+    addHeaderDecoration "case $caseNum: ${cases[$caseNum-1]}"
+    case $caseNum in
+    1)
+      prepareCaseResource $caseNum
+      targetIP=$(kubectl get pod $caseNum-"server" -n $PERF_TEST_NS -o jsonpath={.status.podIP})
+      unicastPerfTest $caseNum-"client" $targetIP
+      cleanCaseResource
+      ;;
+    2)
+      prepareCaseResource $caseNum
+      targetIP=$(kubectl get pod $caseNum-"server" -n $PERF_TEST_NS -o jsonpath={.status.podIP})
+      unicastPerfTest $caseNum-"client" $targetIP
+      cleanCaseResource
+      ;;
+    3)
+      prepareCaseResource $caseNum
+      targetIP=$(kubectl get pod $caseNum-"server" -n $PERF_TEST_NS -o jsonpath={.status.podIP})
+      unicastPerfTest $caseNum-"client" $targetIP
+      cleanCaseResource
+      ;;
+    4)
+      prepareCaseResource $caseNum
+      targetIP=$(kubectl get pod $caseNum-"server" -n $PERF_TEST_NS -o jsonpath={.status.podIP})
+      unicastPerfTest $caseNum-"client" $targetIP
+      cleanCaseResource
+      ;;
+    5)
+      prepareCaseResource $caseNum
+      targetIP=$(kubectl get pod $caseNum-"server" -n $PERF_TEST_NS -o jsonpath={.status.podIP})
+      unicastPerfTest $caseNum-"client" $targetIP
+      cleanCaseResource
+      ;;
+    6)
+      prepareCaseResource $caseNum
+      targetIP=$(kubectl get svc "service"-$caseNum -n $PERF_TEST_NS -o jsonpath={.spec.clusterIP})
+      backendIP=$(kubectl get pod $caseNum-"server" -n $PERF_TEST_NS -o jsonpath={.status.podIP})
+      unicastPerfTest $caseNum-"client" $targetIP $backendIP
+      wrkPerfTest $caseNum-"client" $targetIP 80
+      cleanCaseResource
+      ;;
+    7)
+      prepareCaseResource $caseNum
+      targetIP=$(kubectl get node $NODE1 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+      nodePort=$(kubectl get svc -n perf-test "service"-$caseNum -o jsonpath='{.spec.ports[0].nodePort}')
+      wrkPerfTest $caseNum-"client" $targetIP $nodePort
+      cleanCaseResource
+      ;;
+    8)
+      prepareCaseResource $caseNum
+      targetIP=$(kubectl get node $NODE2 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+      nodePort=$(kubectl get svc -n perf-test "service"-$caseNum -o jsonpath='{.spec.ports[0].nodePort}')
+      wrkPerfTest $caseNum-"client" $targetIP $nodePort
+      cleanCaseResource
+      ;;
+    9)
+      prepareCaseResource $caseNum
+      targetIP=$(kubectl get svc "service"-$caseNum -n $PERF_TEST_NS -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+      if [[ $targetIP != "" ]] ; then
+        wrkPerfTest $caseNum-"client" $targetIP 80
+      else
+        echo "current environment not support lb service"
+      fi
+      cleanCaseResource
+      ;;
+    *)
+      echo "unknown case"
+      ;;
+    esac
+  done
+}
+
+wrkPerfTest() {
+  clientPodName=$1
+  targetSvcIP=$2
+  targetSvcPort=$3
+
+  tmpFileName="wrk-$clientPodName.log"
+  PERF_GC_COMMAND+=("rm -f $tmpFileName")
+  printf "%-15s %-15s %-15s %-15s %-15s\n" "TCP-Conn-Number" "QPS" "Avg-Resp-Time" "Stdev-Resp-Time" "Max-Resp-Time"
+
+  for tcpConnNumber in "10" "100"
+  do
+    kubectl exec $clientPodName -n $PERF_TEST_NS -- wrk -t 4 -c $tcpConnNumber -d $WRK_TIME http://$targetSvcIP:$targetSvcPort > $tmpFileName 2> /dev/null
+    qps=$(awk '/Requests\/sec/ {print $2}' $tmpFileName)
+    avg=$(awk '/Latency/ {print $2}' $tmpFileName)
+    stdev=$(awk '/Latency/ {print $3}' $tmpFileName)
+    max=$(awk '/Latency/ {print $4}' $tmpFileName)
+    printf "%-15s %-15s %-15s %-15s %-15s\n" "$tcpConnNumber" "$qps" "$avg" "$stdev" "$max"
+  done
+}
+
+unicastPerfTest() {
+  clientPodName=$1
+  serverIP=$2
+  backendIP=${3:-""}
+  isSvcTest="false"
+
+  tmpFileName="unicast-$clientPodName.log"
+  PERF_GC_COMMAND+=("rm -f $tmpFileName")
+  LAST_PERF_FAILED_LOG=$tmpFileName
+
+  if [[ $backendIP != "" ]]; then
+    isSvcTest="true"
+  fi
+
+  if [[ $isSvcTest == "true" ]] ; then
+    # qperf use other random tcp/udp port not only 19765
+    if [[ $CNI == "KUBE-OVN" ]]; then
+      getOvnCentralPod
+      PERF_GC_COMMAND+=("kubectl exec "$OVN_NB_POD" -n kube-system -c ovn-central -- ovn-nbctl lb-del test-server ")
+      kubectl exec "$OVN_NB_POD" -n kube-system -c ovn-central -- ovn-nbctl lb-del test-server
+      kubectl exec "$OVN_NB_POD" -n kube-system -c ovn-central -- ovn-nbctl lb-add test-server $serverIP $backendIP
+      kubectl exec "$OVN_NB_POD" -n kube-system -c ovn-central -- ovn-nbctl ls-lb-add ovn-default test-server
+    elif [[ $CNI == "CALICO" ]]; then
+      nodeIP=$(kubectl get pod -A -owide | grep $clientPodName |  awk '{print $8}')
+      calicoNodePod=$(kubectl get pod -A -owide | grep calico-node | grep $nodeIP | awk '{print $2}')
+      PERF_GC_COMMAND+=("kubectl exec -it $calicoNodePod -n kube-system -c calico-node -- iptables -t nat -D PREROUTING -d $serverIP -j DNAT --to-destination $backendIP 2&>1")
+      kubectl exec -it $calicoNodePod -n kube-system -c calico-node -- iptables -t nat -I PREROUTING -d $serverIP -j DNAT --to-destination $backendIP
+    fi
+  fi
+
+  printf "%-15s %-15s %-15s %-15s %-15s %-15s\n" "Size" "TCP Latency" "TCP Bandwidth" "UDP Latency" "UDP Lost Rate" "UDP Bandwidth"
+  for size in "64" "128" "512" "1k" "4k"
+  do
+    if [[ $isSvcTest == "true" && ( $CNI != "CALICO" && $CNI != "KUBE-OVN" ) ]] ; then
+      tcpLat=
+      udpLat=
+    else
+      kubectl exec $clientPodName -n $PERF_TEST_NS -- qperf -t $PERF_TIMES $serverIP -ub -oo msg_size:$size -vu tcp_lat udp_lat > $tmpFileName 2> /dev/null
+      formattedInput=$(cat $tmpFileName | tr -d '\n' | tr -s ' ')
+      tcpLat=$(echo $formattedInput | grep -oP 'tcp_lat: latency = \K[\d.]+ (us|ms|sec)')
+      udpLat=$(echo $formattedInput | grep -oP 'udp_lat: latency = \K[\d.]+ (us|ms|sec)')
+    fi
+
+    kubectl exec $clientPodName -n $PERF_TEST_NS -- iperf3 -c $serverIP -u -t $PERF_TIMES -i 1 -P 10 -b 1000G -l $size > $tmpFileName 2> /dev/null
+    udpBw=$(cat $tmpFileName | grep -oP '\d+\.?\d* [KMG]bits/sec' | tail -n 1)
+    udpLostRate=$(cat $tmpFileName | grep -oP '\(\d+(\.\d+)?%\)' | tail -n 1)
+    kubectl exec $clientPodName -n $PERF_TEST_NS -- iperf3 -c $serverIP -t $PERF_TIMES -i 1 -P 10 -l $size > $tmpFileName 2> /dev/null
+    tcpBw=$(cat $tmpFileName | grep -oP '\d+\.?\d* [KMG]bits/sec' | tail -n 1)
+    printf "%-15s %-15s %-15s %-15s %-15s %-15s\n" "$size" "$tcpLat" "$tcpBw" "$udpLat" "$udpLostRate" "$udpBw"
+  done
+
+  if [[ $isSvcTest == "true" ]] ; then
+    if [[ $CNI == "KUBE-OVN" ]]; then
+      kubectl exec "$OVN_NB_POD" -n kube-system -c ovn-central -- ovn-nbctl lb-del test-server
+    elif [[ $CNI == "CALICO" ]]; then
+      kubectl exec -it $calicoNodePod -n kube-system -c calico-node -- iptables -t nat -D PREROUTING -d $serverIP -j DNAT --to-destination $backendIP
+    fi
+  fi
+}
+
+
+getOvnCentralPod(){
+    NB_POD=$(kubectl get pod -n kube-system -l ovn-nb-leader=true | grep ovn-central | awk '{if($2=="1/1" && $3=="Running") print $1}' | head -n 1 )
+    if [ -z "$NB_POD" ]; then
+      echo "nb leader not exists"
+      exit 1
+    fi
+    OVN_NB_POD=$NB_POD
+}
+
+showHelp(){
+
+  echo "./cni-perf {KUBE-OVN/CALICO/OTHER} {node1Name} {node2Name} [caseList]  caseList -- default: 1,2,3 "
+  echo "======================================================================================================="
+
+  for ((i = 0; i < ${#cases[@]}; i++)); do
+      echo "case $((i+1)): ${cases[$i]}"
+  done
+}
+
+if [ $# -lt 3 ]; then
+  showHelp
+  exit 0
+fi
+
+
+perfTest "$@"
+
+

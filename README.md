@@ -3,6 +3,7 @@ Test Container Network Performace Script
 
 # use method
 
+```
 ./cni-perf {KUBE-OVN/CALICO/OTHER} {node1Name} {node2Name} [caseList]  caseList -- default: 1,2,3
 =======================================================================================================
 case 1: Pod to Pod in the same Nodes
@@ -14,10 +15,11 @@ case 6: Pod to the cluster ip service
 case 7: Host to the Node port service where the Pod is not located on the target Node
 case 8: Host to the Node port service where the Pod is located on the target Node
 case 9: Host to the lb service
-
+```
 
 # example
 
+```
 [root@localhost cni-perf]# ./cni-perf KUBE-OVN kube-ovn-control-plane kube-ovn-worker 1
 =============================== case 1: Pod to Pod in the same Nodes ===============================
 ============================== Prepareing Performance Test Resources ===============================
@@ -34,3 +36,4 @@ Size            TCP Latency     TCP Bandwidth   UDP Latency     UDP Lost Rate   
 4k              23.6 us         1.75 Gbits/sec  19.2 us         (0.28%)         2.42 Gbits/sec
 pod "1-client" deleted
 pod "1-server" deleted
+```
